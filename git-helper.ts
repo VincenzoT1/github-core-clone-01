@@ -321,13 +321,16 @@ export function collectReachableObjects(
   objects: Map<string, GitObject>,
   haves: Iterable<string> = [],
   depth?: number,
+  clientShallows: Iterable<string> = [],
 ): GitObject[] {
+  const shallowSet = new Set(clientShallows);
   const haveSet = new Set<string>();
   const haveQueue = [...haves];
   while (haveQueue.length > 0) {
     const oid = haveQueue.shift()!;
     if (haveSet.has(oid)) continue;
     haveSet.add(oid);
+    if (shallowSet.has(oid)) continue;
     const obj = objects.get(oid);
     if (obj) {
       if (obj.type === 'commit') {
@@ -347,18 +350,20 @@ export function collectReachableObjects(
 
   while (queue.length > 0) {
     const { oid, d } = queue.shift()!;
-    if (visited.has(oid) || haveSet.has(oid)) continue;
+    if (visited.has(oid)) continue;
     visited.add(oid);
     const obj = objects.get(oid);
     if (!obj) continue;
-    result.push(obj);
+    if (!haveSet.has(oid)) {
+      result.push(obj);
+    }
 
     if (obj.type === 'commit') {
       const parsed = parseCommit(obj.data);
       if (parsed.tree && !haveSet.has(parsed.tree)) queue.push({ oid: parsed.tree, d });
       if (depth === undefined || d < depth) {
         for (const p of parsed.parents) {
-          if (!haveSet.has(p)) queue.push({ oid: p, d: d + 1 });
+          queue.push({ oid: p, d: d + 1 });
         }
       }
     } else if (obj.type === 'tree') {

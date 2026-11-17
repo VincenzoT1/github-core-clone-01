@@ -72,6 +72,7 @@ interface Repo {
   commits: Array<{ sha: string; message: string; author: string; date: string; branch?: string }>;
   labels: Set<string>;
   issues: Issue[];
+  issuesByNumber: Map<number, Issue>;
   pulls: Pull[];
   objects: Map<string, GitObject>; // sha -> GitObject
 }
@@ -120,24 +121,28 @@ function makeOpaqueId(type: string, id: number | string): string {
   return Buffer.from(`${type}:${id}`).toString('base64');
 }
 
+let reqCounter = 0;
+function fastReqId(): string {
+  reqCounter = (reqCounter + 1) | 0;
+  return 'req_' + reqCounter;
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
-  const reqId = randomUUID();
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'content-length': Buffer.byteLength(text),
-    'x-github-request-id': reqId,
+    'x-github-request-id': fastReqId(),
     ...headers,
   });
   res.end(text);
 }
 
 function sendRaw(res: ServerResponse, status: number, buffer: Buffer, contentType: string, headers: Record<string, string> = {}): void {
-  const reqId = randomUUID();
   res.writeHead(status, {
     'content-type': contentType,
     'content-length': buffer.length,
-    'x-github-request-id': reqId,
+    'x-github-request-id': fastReqId(),
     ...headers,
   });
   res.end(buffer);
@@ -152,16 +157,25 @@ function parseUrl(req: IncomingMessage): URL {
   }
 }
 
-async function readBody(req: IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks).toString('utf-8');
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      data += chunk;
+    });
+    req.on('end', () => resolve(data));
+    req.on('error', reject);
+  });
 }
 
-async function readRawBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks);
+function readRawBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
 function decodePktLines(buf: Buffer): { lines: string[]; consumed: number } {
@@ -275,6 +289,7 @@ export function createApp(): Server {
           commits: [],
           labels: new Set(['bug', 'enhancement']),
           issues: [],
+          issuesByNumber: new Map(),
           pulls: [],
           objects: new Map(),
         };
@@ -622,6 +637,7 @@ export function createApp(): Server {
               created_at: new Date().toISOString(),
             };
             r.issues.push(newIssue);
+            r.issuesByNumber.set(newIssue.number, newIssue);
             sendJson(res, 201, {
               id: newIssue.id,
               node_id: newIssue.nodeId,
@@ -641,7 +657,7 @@ export function createApp(): Server {
         if (issueNumMatch) {
           const num = parseInt(issueNumMatch[1], 10);
           const issueSub = issueNumMatch[2] ?? '';
-          const issue = r.issues.find((i) => i.number === num);
+          const issue = r.issuesByNumber.get(num) ?? r.issues.find((i) => i.number === num);
           if (!issue) return sendJson(res, 404, { message: 'Not Found' });
 
           if (issueSub === '' || issueSub === '/') {
@@ -978,6 +994,7 @@ export function createApp(): Server {
               commits: [],
               labels: new Set(['bug']),
               issues: [],
+              issuesByNumber: new Map(),
               pulls: [],
               objects: new Map(),
             };
@@ -1067,6 +1084,7 @@ export function createApp(): Server {
               created_at: new Date().toISOString(),
             };
             r.issues.push(issueObj);
+            r.issuesByNumber.set(issueObj.number, issueObj);
             const issueOut = {
               id: issueObj.id,
               node_id: issueObj.nodeId,
@@ -1302,7 +1320,7 @@ export function createApp(): Server {
 
             if (query.includes('issue(')) {
               const num = vars.number;
-              const issue = r.issues.find((i) => i.number === num);
+              const issue = r.issuesByNumber.get(num) ?? r.issues.find((i) => i.number === num);
               repoData.issue = issue
                 ? {
                     number: issue.number,
@@ -1706,7 +1724,7 @@ export function createApp(): Server {
               }
             }
 
-            const reachable = collectReachableObjects(wants, r.objects, haves, depth);
+            const reachable = collectReachableObjects(wants, r.objects, haves, depth, clientShallows);
             const packBytes = writePack(reachable);
 
             const acks = encodePktLine('acknowledgments\n');
